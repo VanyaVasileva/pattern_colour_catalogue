@@ -52,7 +52,7 @@ import re
 from typing import Iterable
 
 import streamlit as st
-from PIL import Image, ImageColor, ImageDraw
+from PIL import Image, ImageColor, ImageDraw, ImageCms
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +65,12 @@ DEFAULT_FIXED_BACKGROUND = "#F7F4EE"
 DEFAULT_DOODLE_BACKGROUND = "#FCFBF8"
 DEFAULT_BACKGROUND_ONLY = "#FFFFFF"
 ITEMS_PER_PAGE = 12
+
+# All catalogue colours and customer downloads use sRGB.  Hex colours entered
+# in the UI are interpreted as sRGB values, so source artwork is converted into
+# the same colour space before compositing and the profile is embedded on save.
+SRGB_PROFILE = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB"))
+SRGB_ICC_BYTES = SRGB_PROFILE.tobytes()
 
 
 # ---------------------------------------------------------------------------
@@ -275,14 +281,42 @@ def make_demo_tile() -> Image.Image:
     return tile
 
 
+def convert_image_to_srgb(image: Image.Image) -> Image.Image:
+    """Convert embedded RGB colour profiles to sRGB while preserving alpha."""
+    rgba = image.convert("RGBA")
+    embedded_profile = image.info.get("icc_profile")
+
+    if embedded_profile:
+        try:
+            source_profile = ImageCms.ImageCmsProfile(BytesIO(embedded_profile))
+            rgba = ImageCms.profileToProfile(
+                rgba,
+                source_profile,
+                SRGB_PROFILE,
+                outputMode="RGBA",
+            )
+        except (ImageCms.PyCMSError, OSError, ValueError, TypeError):
+            # If an asset contains malformed profile metadata, keep its pixels and
+            # treat them as sRGB rather than allowing an old profile to leak into
+            # the customer download.
+            rgba = image.convert("RGBA")
+
+    rgba.info["icc_profile"] = SRGB_ICC_BYTES
+    return rgba
+
+
 @st.cache_data(show_spinner=False)
 def load_source(path_text: str | None) -> Image.Image:
     if not path_text:
-        return make_demo_tile()
-    # Keep the uploaded tile at its complete original resolution. The same
-    # full-resolution pixels are used for the on-screen preview and downloads.
+        demo = make_demo_tile()
+        demo.info["icc_profile"] = SRGB_ICC_BYTES
+        return demo
+    # Keep the uploaded tile at its complete original resolution. If it carries
+    # Display P3, Adobe RGB or another embedded RGB profile, convert its colour
+    # values to sRGB before any recolouring/compositing happens.
     with Image.open(path_text) as image:
-        return image.convert("RGBA")
+        image.load()
+        return convert_image_to_srgb(image)
 
 
 def recolour_alpha_art(source: Image.Image, colour: str) -> Image.Image:
@@ -306,13 +340,16 @@ def compose_tile(
     fixed_or_selected_bg = background_colour if mode in {"both", "background"} else DEFAULT_FIXED_BACKGROUND
     base = Image.new("RGBA", source.size, (*hex_rgb(fixed_or_selected_bg), 255))
     base.alpha_composite(foreground)
-    return base.convert("RGB")
+    result = base.convert("RGB")
+    result.info["icc_profile"] = SRGB_ICC_BYTES
+    return result
 
 
 def image_download_bytes(image: Image.Image, file_format: str) -> bytes:
-    """Encode the exact full-resolution tile for a customer download."""
+    """Encode the exact full-resolution tile as a colour-managed sRGB download."""
     output = BytesIO()
     rgb_image = image.convert("RGB")
+    rgb_image.info["icc_profile"] = SRGB_ICC_BYTES
     if file_format == "JPEG":
         rgb_image.save(
             output,
@@ -320,6 +357,7 @@ def image_download_bytes(image: Image.Image, file_format: str) -> bytes:
             quality=95,
             subsampling=0,
             dpi=(300, 300),
+            icc_profile=SRGB_ICC_BYTES,
         )
     elif file_format == "TIFF":
         rgb_image.save(
@@ -327,6 +365,7 @@ def image_download_bytes(image: Image.Image, file_format: str) -> bytes:
             format="TIFF",
             compression="tiff_lzw",
             dpi=(300, 300),
+            icc_profile=SRGB_ICC_BYTES,
         )
     else:
         raise ValueError(f"Unsupported download format: {file_format}")
